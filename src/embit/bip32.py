@@ -9,6 +9,21 @@ from binascii import hexlify
 
 HARDENED_INDEX = const(0x80000000)
 
+# Known extended-key version bytes (xprv/yprv/zprv/... and xpub/ypub/zpub/...),
+# collected once from NETWORKS. HDKey.__init__ used to validate its version by
+# base58-encoding the whole key and checking the "prv"/"pub" prefix — a base58
+# encode + double-SHA256 on EVERY constructed node (i.e. on every CKD level). The
+# version is fully determined by these 4-byte constants, so a set membership test
+# is equivalent and avoids that per-node hashing on the derivation hot path.
+_PRV_VERSIONS = frozenset(
+    v for net in NETWORKS.values()
+    for k, v in net.items() if isinstance(k, str) and k.endswith("prv")
+)
+_PUB_VERSIONS = frozenset(
+    v for net in NETWORKS.values()
+    for k, v in net.items() if isinstance(k, str) and k.endswith("pub")
+)
+
 
 class HDError(EmbitError):
     pass
@@ -41,10 +56,16 @@ class HDKey(EmbitKey):
         self.fingerprint = fingerprint
         self._my_fingerprint = b""
         self.child_number = child_number
-        # check that base58[1:4] is "prv" or "pub"
-        if self.is_private and self.to_base58()[1:4] != "prv":
-            raise HDError("Invalid version")
-        if not self.is_private and self.to_base58()[1:4] != "pub":
+        # Per-node child cache (index -> HDKey); see child(). Cheap on nodes that
+        # are never derived from.
+        self._children = {}
+        # Validate the version against the known xprv/xpub-family constants instead
+        # of base58-encoding the whole key on every constructed node (see
+        # _PRV_VERSIONS / _PUB_VERSIONS above). Equivalent for all NETWORKS versions.
+        if self.is_private:
+            if self.version not in _PRV_VERSIONS:
+                raise HDError("Invalid version")
+        elif self.version not in _PUB_VERSIONS:
             raise HDError("Invalid version")
 
     @classmethod
@@ -192,6 +213,14 @@ class HDKey(EmbitKey):
         if hardened and not self.is_private:
             raise HDError("Can't do hardened with public key")
 
+        # Memoize by (now-normalized) index: child derivation is deterministic and
+        # returns a fresh node, so repeated derivations of the same index — common
+        # when several PSBT inputs share a change/receive branch — reuse one node
+        # instead of recomputing the HMAC-SHA512 + EC tweak each time.
+        cached = self._children.get(index)
+        if cached is not None:
+            return cached
+
         # we need pubkey for fingerprint anyways
         sec = self.sec()
         fingerprint = hashes.hash160(sec)[:4]
@@ -210,7 +239,7 @@ class HDKey(EmbitKey):
             point = copy(self.key._point)
             point = secp256k1.ec_pubkey_add(point, secret)
             key = ec.PublicKey(point)
-        return HDKey(
+        child = HDKey(
             key,
             chain_code,
             version=self.version,
@@ -218,6 +247,8 @@ class HDKey(EmbitKey):
             fingerprint=fingerprint,
             child_number=index,
         )
+        self._children[index] = child
+        return child
 
     def derive(self, path):
         """path: int array or a string starting with m/"""
